@@ -1,1 +1,3 @@
-
+In my Bachelor's thesis project, I have implemented few ML and DL algorithms in order to predict the significant height of wind waves given the mean period of wind wave. So, I have collectde hourly ocean wave data from "era5 copernicus climate data store". 
+I have observed the data by plotting the graphs and found out few pattens, noted those patterns and implemented the code of the algorithms accordingly to obtain the best results.
+Among Random Forest Regressor, Long-Short Term Memory (LSTM) and Artificial Neural Networks (ANN) algorithms, the ANN model has performed well due to it's lag featues which already identified the trend in the pattern and made the work easy for ANN to train the itself using the added information.
