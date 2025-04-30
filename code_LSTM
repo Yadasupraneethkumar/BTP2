@@ -1,0 +1,175 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import KFold
+import torch
+from torch import nn, optim
+from torch.utils.data import DataLoader, Dataset
+
+# Load dataset
+df = pd.read_excel('Complete_raw.xlsx')
+df.head()
+
+assert 'shww' in df.columns, "Column 'shww' is missing from the dataframe!"
+assert 'mpww' in df.columns, "Column 'mpww' is missing from the dataframe!"
+
+
+# Split into training (2020-2022) and testing (2023)
+train_df = df[df['Time'].dt.year < 2023]
+test_df = df[df['Time'].dt.year == 2023]
+
+
+# Normalization using .loc to avoid SettingWithCopyWarning
+scaler = MinMaxScaler()
+train_df.loc[:, ['mpww', 'shww']] = scaler.fit_transform(train_df[['mpww', 'shww']])
+test_df.loc[:, ['mpww', 'shww']] = scaler.transform(test_df[['mpww', 'shww']])
+
+
+# Sliding Window Technique
+def create_sequences(data, dat, target_column, seq_length):
+    xs, ys = [], []
+    for i in range(len(data) - seq_length):
+        x = data.iloc[i:(i + seq_length)].values
+        y = dat.iloc[i + seq_length][target_column]
+        xs.append(x)
+        ys.append(y)
+    return np.array(xs), np.array(ys)
+
+SEQ_LENGTH = 5  # Use previous 5 time steps
+
+# 'mpww' should be used for input, and 'shww' is the target
+X_train, y_train = create_sequences(train_df[['mpww']], train_df, 'shww', SEQ_LENGTH)
+X_test, y_test = create_sequences(test_df[['mpww']], test_df, 'shww', SEQ_LENGTH)
+
+
+# Convert to PyTorch tensors
+X_train_tensors = torch.tensor(X_train, dtype=torch.float32)
+y_train_tensors = torch.tensor(y_train, dtype=torch.float32)
+X_test_tensors = torch.tensor(X_test, dtype=torch.float32)
+y_test_tensors = torch.tensor(y_test, dtype=torch.float32)
+
+# PyTorch Dataset
+class TimeSeriesDataset(Dataset):
+    def __init__(self, features, targets):
+        self.features = features
+        self.targets = targets
+    
+    def __len__(self):
+        return len(self.targets)
+    
+    def __getitem__(self, index):
+        return self.features[index], self.targets[index]
+
+train_dataset = TimeSeriesDataset(X_train_tensors, y_train_tensors)
+test_dataset = TimeSeriesDataset(X_test_tensors, y_test_tensors)
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+
+class ImprovedLSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
+        super(ImprovedLSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+    
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        out = self.fc(lstm_out[:, -1, :])  # Only take the output of the last time step
+        return out
+
+
+# Model Parameters
+input_size = 1  # Only mpww as input
+hidden_size = 64
+num_layers = 2
+output_size = 1  # Predicting shww
+
+model = ImprovedLSTMModel(input_size, hidden_size, num_layers, output_size)
+
+
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# KFold Cross-Validation
+kf = KFold(n_splits=5)
+fold = 1
+
+for train_idx, val_idx in kf.split(X_train_tensors):
+    print(f"Training fold {fold}...")
+    fold += 1
+    
+    X_train_fold, X_val_fold = X_train_tensors[train_idx], X_train_tensors[val_idx]
+    y_train_fold, y_val_fold = y_train_tensors[train_idx], y_train_tensors[val_idx]
+    
+    train_fold_dataset = TimeSeriesDataset(X_train_fold, y_train_fold)
+    val_fold_dataset = TimeSeriesDataset(X_val_fold, y_val_fold)
+    
+    train_loader_fold = DataLoader(train_fold_dataset, batch_size=64, shuffle=True)
+    val_loader_fold = DataLoader(val_fold_dataset, batch_size=64, shuffle=False)
+
+    for epoch in range(10):  # Train for 10 epochs
+        model.train()
+        for X_batch, y_batch in train_loader_fold:
+            optimizer.zero_grad()
+            output = model(X_batch)
+            loss = criterion(output.squeeze(), y_batch)
+            loss.backward()
+            optimizer.step()
+
+        # Validate after each epoch
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader_fold:
+                output = model(X_batch)
+                val_loss += criterion(output.squeeze(), y_batch).item()
+        print(f"Epoch {epoch + 1}, Validation Loss: {val_loss / len(val_loader_fold)}")
+
+print("Cross-validation finished.")
+
+
+model.eval()  # Set model to evaluation mode
+
+y_pred_list = []
+y_true_list = []
+
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        output = model(X_batch)
+        y_pred_list.extend(output.squeeze().tolist())
+        y_true_list.extend(y_batch.tolist())
+# Rescale predictions back to the original scale
+# Since we scaled both 'mpww' and 'shww', we need to transform only 'shww'.
+# We'll create an array of the same shape, with zeros for 'mpww' and the predicted values for 'shww'.
+
+# Create an array for the predicted and true values
+y_pred_scaled = np.zeros((len(y_pred_list), 2))  # shape (N, 2) where N is the number of samples
+y_true_scaled = np.zeros((len(y_true_list), 2))
+
+# Insert predicted values into the second column (index 1) for 'shww'
+y_pred_scaled[:, 1] = np.array(y_pred_list)
+y_true_scaled[:, 1] = np.array(y_true_list)
+
+# Now apply inverse transform on both 'mpww' and 'shww'
+y_pred_rescaled = scaler.inverse_transform(y_pred_scaled)[:, 1]  # Get only 'shww' values after inverse transform
+y_true_rescaled = scaler.inverse_transform(y_true_scaled)[:, 1]  # Get only 'shww' values after inverse transform
+
+# Calculate R² Score
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+mae = mean_squared_error(y_true_rescaled, y_pred_rescaled)
+mse = mean_absolute_error(y_true_rescaled, y_pred_rescaled)
+r2 = r2_score(y_true_rescaled, y_pred_rescaled)
+print("R² score after rescaling:", r2)
+print("Mean Squared Error : ", mse)
+print("Mean Absolute Error : ", mae)
+# Plot the results
+import matplotlib.pyplot as plt
+
+plt.scatter(y_true_rescaled, y_pred_rescaled, label='Predicted', color='r', alpha=0.6)
+plt.scatter(y_true_rescaled, y_true_rescaled, label='True', color='b', alpha=0.6)
+plt.title('True vs Predicted SHWW values for 2023')
+plt.xlabel('True Values (shww)')
+plt.ylabel('Predicted Values (shww)')
+plt.legend(loc='upper left')
+plt.show()
