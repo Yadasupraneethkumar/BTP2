@@ -1,0 +1,159 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_absolute_error,mean_squared_error
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+
+
+# Load the dataset
+data = pd.read_excel('Detailed_Complete_raw.xlsx')
+
+# Extract time-based features
+data['Time'] = pd.to_datetime(data['Time'])
+data['hour'] = data['Time'].dt.hour
+data['day'] = data['Time'].dt.day
+data['month'] = data['Time'].dt.month
+data['year'] = data['Time'].dt.year
+
+# Cyclical encoding
+data['hour_sin'] = np.sin(2 * np.pi * data['hour'] / 24)
+data['hour_cos'] = np.cos(2 * np.pi * data['hour'] / 24)
+data['month_sin'] = np.sin(2 * np.pi * data['month'] / 12)
+data['month_cos'] = np.cos(2 * np.pi * data['month'] / 12)
+
+# Add lag features
+data['shww_t-1'] = data['shww'].shift(1)
+data['shww_t-2'] = data['shww'].shift(2)
+
+# Drop the original 'Time' and unused columns
+data.drop(['Time', 'hour', 'month'], axis=1, inplace=True)
+data.dropna(inplace=True)  # Drop rows with NaNs due to lagging
+
+# Separate features and target
+X = data.drop('shww', axis=1)
+y = data['shww']
+
+# Preprocessing
+preprocessor = ColumnTransformer([
+    ('num', StandardScaler(), ['mpww', 'day', 'year', 'hour_sin', 'hour_cos', 'month_sin', 'month_cos', 'shww_t-1', 'shww_t-2']),
+    ('cat', OneHotEncoder(), ['season', 'TOD'])
+])
+
+X_preprocessed = preprocessor.fit_transform(X)
+
+
+if hasattr(X_preprocessed, 'toarray'):
+    X_preprocessed = X_preprocessed.toarray()
+
+# Train/test split
+X_train, X_test, y_train, y_test = train_test_split(X_preprocessed, y, test_size=0.2, random_state=42)
+
+# Convert to tensors
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+y_train_tensor = torch.tensor(y_train.values, dtype=torch.float32).view(-1, 1)
+y_test_tensor = torch.tensor(y_test.values, dtype=torch.float32).view(-1, 1)
+
+# Further split training into train/validation
+X_train_final, X_val_tensor, y_train_final, y_val_tensor = train_test_split(X_train_tensor, y_train_tensor, test_size=0.1, random_state=42)
+
+# DataLoader
+train_dataset = TensorDataset(X_train_final, y_train_final)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+
+
+# Define the improved ANN model
+class ImprovedANNModel(nn.Module):
+    def __init__(self, input_dim):
+        super(ImprovedANNModel, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, 64)
+        self.fc4 = nn.Linear(64, 32)
+        self.fc5 = nn.Linear(32, 1)
+        self.dropout = nn.Dropout(0.2)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = torch.relu(self.fc2(x))
+        x = self.dropout(x)
+        x = torch.relu(self.fc3(x))
+        x = self.dropout(x)
+        x = torch.relu(self.fc4(x))
+        return self.fc5(x)
+
+
+# Initialize model
+input_dim = X_train_tensor.shape[1]
+model = ImprovedANNModel(input_dim)
+
+# Define loss, optimizer, scheduler
+criterion = nn.MSELoss()
+optimizer = optim.AdamW(model.parameters(), lr=0.001)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+
+
+# Training loop with validation monitoring
+epochs = 200
+best_val_loss = float('inf')
+best_model = None
+
+for epoch in range(epochs):
+    model.train()
+    for xb, yb in train_loader:
+        optimizer.zero_grad()
+        output = model(xb)
+        loss = criterion(output, yb)
+        loss.backward()
+        optimizer.step()
+    scheduler.step()
+
+    # Validation
+    model.eval()
+    with torch.no_grad():
+        val_preds = model(X_val_tensor)
+        val_loss = criterion(val_preds, y_val_tensor)
+
+    if val_loss.item() < best_val_loss:
+        best_val_loss = val_loss.item()
+        best_model = model.state_dict()
+
+    if (epoch + 1) % 10 == 0:
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}")
+
+
+model.eval()
+with torch.no_grad():
+    predictions = model(X_test_tensor)
+    
+    # Convert tensors to numpy arrays
+    true_vals = y_test_tensor.flatten().numpy()
+    pred_vals = predictions.flatten().numpy()
+
+    # Metrics
+    r2 = r2_score(true_vals, pred_vals)
+    mae = mean_absolute_error(true_vals, pred_vals)
+    rmse = np.sqrt(mean_squared_error(true_vals, pred_vals))
+    
+    print(f'R² on the test set: {r2:.4f}')
+    print(f"MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+
+# ======== PLOT: TRUE VS PREDICTED ========
+plt.figure(figsize=(10, 6))
+plt.scatter(true_vals, true_vals, alpha=0.6, color='g', label='True Values (Ideal)')
+plt.scatter(true_vals, pred_vals, alpha=0.6, color='b', label='Predicted Values')
+plt.plot([true_vals.min(), true_vals.max()], [true_vals.min(), true_vals.max()], 'r--', lw=2)
+plt.title(f'True Values vs Predictions (R² = {r2:.4f})')
+plt.xlabel('True Values')
+plt.ylabel('Predictions')
+plt.legend(loc="upper left")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
